@@ -1,0 +1,3 @@
+glfw
+moderngl
+numpy
