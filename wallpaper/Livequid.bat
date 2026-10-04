@@ -6,15 +6,15 @@ cd /d "%~dp0"
 if exist ".venv\ready" goto run
 if exist ".venv" rmdir /s /q ".venv"
 
-rem needs Python 3.10-3.13 (3.14 has no prebuilt moderngl yet)
 set "PY="
-for %%V in (3.12 3.13 3.11 3.10) do if not defined PY py -%%V -c "pass" >nul 2>nul && set "PY=py -%%V"
+where py >nul 2>nul && set "PY=py -3"
+if not defined PY where python >nul 2>nul && set "PY=python"
 if defined PY goto setup
 
-echo Python 3.10-3.13 was not found (3.14 is too new for now).
-choice /m "Install Python 3.12 now with winget (per-user)"
+echo Python 3 was not found.
+choice /m "Install the latest Python now with winget (per-user)"
 if errorlevel 2 goto fail
-winget install -e --id Python.Python.3.12 --scope user
+winget install -e --id Python.Python.3.13 --scope user
 echo.
 echo Done. Close this window and double-click Livequid.bat again.
 pause

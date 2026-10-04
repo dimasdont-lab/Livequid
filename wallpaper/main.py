@@ -11,7 +11,6 @@ import traceback
 from pathlib import Path
 
 import glfw
-import moderngl
 
 from sim import Gel
 from renderer import Renderer
@@ -64,11 +63,10 @@ def main():
     if WIN and not args.windowed:
         winutil.embed_in_desktop(glfw.get_win32_window(win))
 
-    ctx = moderngl.create_context()
     min_h = min(r[3] - r[1] for r in rects)
     r0 = max(8.0, min_h * 0.0145)                         # gel scales with the screen
     gel = Gel(rects, r0, args.particles)
-    rend = Renderer(ctx, vw, vh, r0, args.particles, args.field_scale, grid=max(24.0, min_h / 22))
+    rend = Renderer(vw, vh, r0, args.particles, args.field_scale, grid=max(24.0, min_h / 22))
 
     SUB = 1.0 / 120.0
     acc, last, t0 = 0.0, time.perf_counter(), time.perf_counter()

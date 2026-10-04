@@ -7,14 +7,17 @@ Pass 2  one full-screen shader turns that field into a glass surface:
         refraction of the (procedural) grid, chromatic fringe, fresnel rim,
         specular highlights and inner caustics.
 """
+import ctypes
+
 import numpy as np
-import moderngl
+from OpenGL import GL
+from OpenGL.GL import shaders as glsh
 
 SPLAT_VS = """
 #version 330
 uniform vec2 world;
-in vec2 corner;
-in vec4 inst;                       // x, y, kernel radius, weight
+layout(location = 0) in vec2 corner;
+layout(location = 1) in vec4 inst;                       // x, y, kernel radius, weight
 out vec2 d;
 out vec2 rw;
 void main() {
@@ -43,7 +46,7 @@ void main() {
 
 QUAD_VS = """
 #version 330
-in vec2 corner;
+layout(location = 0) in vec2 corner;
 void main() { gl_Position = vec4(corner, 0.0, 1.0); }
 """
 
@@ -160,52 +163,97 @@ void main() {
 """
 
 
+def _program(vs, fs):
+    return glsh.compileProgram(glsh.compileShader(vs, GL.GL_VERTEX_SHADER),
+                               glsh.compileShader(fs, GL.GL_FRAGMENT_SHADER), validate=False)
+
+
 class Renderer:
-    def __init__(self, ctx, width, height, r0, max_particles, field_scale=0.5, grid=48.0):
-        self.ctx = ctx
+    """Needs a current OpenGL 3.3 core context (created by the caller)."""
+
+    def __init__(self, width, height, r0, max_particles, field_scale=0.5, grid=48.0):
         self.w, self.h = int(width), int(height)
         self.r0 = float(r0)
-        self.grid = float(grid)
         self.thr = 0.62
+        self.fw = max(1, int(self.w * field_scale))
+        self.fh = max(1, int(self.h * field_scale))
 
-        fw, fh = max(1, int(self.w * field_scale)), max(1, int(self.h * field_scale))
-        self.field_tex = ctx.texture((fw, fh), 4, dtype="f2")
-        self.field_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.field_tex.repeat_x = self.field_tex.repeat_y = False
-        self.field_fbo = ctx.framebuffer(color_attachments=[self.field_tex])
+        # half-resolution float texture holding (field, dfield/dx, dfield/dy)
+        self.tex = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA16F, self.fw, self.fh, 0, GL.GL_RGBA, GL.GL_HALF_FLOAT, None)
+        for k, v in ((GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR), (GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR),
+                     (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE), (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, k, v)
+        self.fbo = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, self.tex, 0)
+        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+        if status != GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError("float framebuffer not supported by this GPU/driver (status %s)" % status)
 
-        self.splat = ctx.program(vertex_shader=SPLAT_VS, fragment_shader=SPLAT_FS)
-        self.splat["world"].value = (self.w, self.h)
-        self.splat["gscale"].value = self.r0
-        self.glass = ctx.program(vertex_shader=QUAD_VS, fragment_shader=GLASS_FS)
-        self.glass["res"].value = (self.w, self.h)
-        self.glass["r0"].value = self.r0
-        self.glass["grid"].value = self.grid
-        self.glass["thr"].value = self.thr
-        self.glass["field"].value = 0
+        self.splat = _program(SPLAT_VS, SPLAT_FS)
+        self.glass = _program(QUAD_VS, GLASS_FS)
+        GL.glUseProgram(self.splat)
+        GL.glUniform2f(GL.glGetUniformLocation(self.splat, "world"), self.w, self.h)
+        GL.glUniform1f(GL.glGetUniformLocation(self.splat, "gscale"), self.r0)
+        GL.glUseProgram(self.glass)
+        loc = lambda n: GL.glGetUniformLocation(self.glass, n)
+        GL.glUniform2f(loc("res"), self.w, self.h)
+        GL.glUniform1f(loc("r0"), self.r0)
+        GL.glUniform1f(loc("grid"), float(grid))
+        GL.glUniform1f(loc("thr"), self.thr)
+        GL.glUniform1i(loc("field"), 0)
+        self.u_time = loc("time")
 
-        quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
-        self.quad_vbo = ctx.buffer(quad.tobytes())
-        self.inst_vbo = ctx.buffer(reserve=max_particles * 16, dynamic=True)
-        self.splat_vao = ctx.vertex_array(
-            self.splat, [(self.quad_vbo, "2f", "corner"), (self.inst_vbo, "4f/i", "inst")])
-        self.glass_vao = ctx.vertex_array(self.glass, [(self.quad_vbo, "2f", "corner")])
-        self.count = 0
+        quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
+        self.quad_vbo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.quad_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, quad.nbytes, quad, GL.GL_STATIC_DRAW)
+        self.inst_vbo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.inst_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, max_particles * 16, None, GL.GL_DYNAMIC_DRAW)
 
-    def render(self, inst, time, target=None):
-        """inst: (n, 4) float32 -> x, y, kernel radius, weight."""
-        ctx = self.ctx
-        self.count = len(inst)
-        self.inst_vbo.write(np.ascontiguousarray(inst, dtype="f4").tobytes())
+        self.glass_vao = GL.glGenVertexArrays(1)
+        GL.glBindVertexArray(self.glass_vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.quad_vbo)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, 0, ctypes.c_void_p(0))
 
-        self.field_fbo.use()
-        self.field_fbo.clear(0.0, 0.0, 0.0, 0.0)
-        ctx.enable(moderngl.BLEND)
-        ctx.blend_func = moderngl.ONE, moderngl.ONE
-        self.splat_vao.render(moderngl.TRIANGLE_STRIP, instances=self.count)
-        ctx.disable(moderngl.BLEND)
+        self.splat_vao = GL.glGenVertexArrays(1)
+        GL.glBindVertexArray(self.splat_vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.quad_vbo)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, 0, ctypes.c_void_p(0))
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.inst_vbo)
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 4, GL.GL_FLOAT, False, 0, ctypes.c_void_p(0))
+        GL.glVertexAttribDivisor(1, 1)
+        GL.glBindVertexArray(0)
 
-        (target or ctx.screen).use()
-        self.field_tex.use(0)
-        self.glass["time"].value = float(time)
-        self.glass_vao.render(moderngl.TRIANGLE_STRIP)
+    def render(self, inst, time, target=0):
+        """inst: (n, 4) float32 -> x, y, kernel radius, weight. target: framebuffer id (0 = window)."""
+        inst = np.ascontiguousarray(inst, dtype=np.float32)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.inst_vbo)
+        GL.glBufferSubData(GL.GL_ARRAY_BUFFER, 0, inst.nbytes, inst)
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glViewport(0, 0, self.fw, self.fh)
+        GL.glClearColor(0, 0, 0, 0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE)
+        GL.glUseProgram(self.splat)
+        GL.glBindVertexArray(self.splat_vao)
+        GL.glDrawArraysInstanced(GL.GL_TRIANGLE_STRIP, 0, 4, len(inst))
+        GL.glDisable(GL.GL_BLEND)
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, target)
+        GL.glViewport(0, 0, self.w, self.h)
+        GL.glUseProgram(self.glass)
+        GL.glUniform1f(self.u_time, float(time))
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glBindVertexArray(self.glass_vao)
+        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
