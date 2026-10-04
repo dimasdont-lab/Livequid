@@ -2,11 +2,13 @@
 
   python main.py              run as the desktop wallpaper
   python main.py --windowed   debug: normal window instead of wallpaper
-Quit with Ctrl+Alt+Q (or stop.bat).
+Quit: tray icon -> Exit, or Ctrl+Alt+Q, or Stop.bat.
 """
 import argparse
 import sys
 import time
+import traceback
+from pathlib import Path
 
 import glfw
 import moderngl
@@ -17,6 +19,7 @@ from renderer import Renderer
 WIN = sys.platform == "win32"
 if WIN:
     import winutil
+    import tray as tray_mod
 
 
 def main():
@@ -38,6 +41,11 @@ def main():
         rects = [(0, 0, vw, vh)]
         vx = vy = 0
     rects = [(a - vx, b - vy, c - vx, d - vy) for a, b, c, d in rects]   # to canvas coordinates
+
+    tray = None
+    if WIN and not args.windowed:
+        tray = tray_mod.Tray()
+        tray.start()
 
     if not glfw.init():
         raise SystemExit("glfw init failed")
@@ -69,8 +77,12 @@ def main():
         glfw.poll_events()
         now = time.perf_counter()
         if WIN:
-            if winutil.quit_hotkey_down():
+            if winutil.quit_hotkey_down() or (tray and tray.quit.is_set()):
                 break
+            if tray and tray.paused.is_set():
+                time.sleep(0.1)
+                last = time.perf_counter()
+                continue
             if now - paused_check > 0.5:                   # don't burn GPU under a fullscreen game
                 paused_check = now
                 asleep = winutil.fullscreen_app_active()
@@ -95,7 +107,25 @@ def main():
         if args.fps < 60:                                  # vsync is 60+; sleep to lower the rate
             time.sleep(max(0.0, 1.0 / args.fps - (time.perf_counter() - now)))
     glfw.terminate()
+    if tray:
+        tray.stop()
+        time.sleep(0.1)
+
+
+def single_instance():
+    """False if another Livequid is already running."""
+    import ctypes
+    ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\LivequidWallpaper")
+    return ctypes.windll.kernel32.GetLastError() != 183       # ERROR_ALREADY_EXISTS
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        if WIN and "--windowed" not in sys.argv and not single_instance():
+            sys.exit(0)
+        main()
+    except SystemExit:
+        raise
+    except Exception:                                          # pythonw has no console: keep a log
+        Path(__file__).with_name("livequid.log").write_text(traceback.format_exc(), encoding="utf-8")
+        raise
